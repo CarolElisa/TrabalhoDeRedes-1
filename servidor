@@ -1,29 +1,233 @@
 #!/usr/bin/env python3
 import asyncio
-from tcp import Servidor
+from grader.tcp import Servidor
 import re
+import warnings
 
+MSG_END = b'\r\n'
+all_nicknames = {}
+all_channels = {}
 
-def validar_nome(nome):
-    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
-
+def validar_nome(nickname):
+    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nickname) is not None
 
 def sair(conexao):
     print(conexao, 'conexão fechada')
-    conexao.fechar()
 
+    #Passo 8 -  QUIT
+    conexao_antiga = conexao
+    nick_antigo = conexao_antiga.nick_atual
 
+    # Deleta o nick usado pelo usuario que esta saindo
+    if (all_nicknames.get(nick_antigo.lower())):
+        del all_nicknames[nick_antigo.lower()]
+
+    # Remove a conexao da lista de leitores, logo, ela nao tera que lidar mais 
+    # com quaisquer retornos do callback ou dados enviados de outros
+    asyncio.get_event_loop().remove_reader(conexao.s)
+
+    for chan in conexao_antiga.channels:
+        for con in chan.conexoes:
+            if con != conexao: # Envia a mensagem de saida para todos os outros usuarios
+                con.enviar(b':' + conexao_antiga.nick_atual + b' QUIT :Connection closed' + MSG_END)
+        
+        # Passo 10 
+        # Apos enviar todas as mensagens QUIT para um dos canais do laco, 
+        # deve-se ja remover o nick do usuario desse canal
+        chan.conexoes.remove(conexao_antiga)
+        conexao_antiga.channels.remove(chan)
+    
+    # Finalmente, fecha-se a conexao com a funcao da camada TCP
+    conexao.s.close()
+
+#Passo 1 - PING/PONG
+def ping(conexao, dados):
+    conexao.enviar(b':server PONG server :' + dados.split(b' ', 1)[1])
+    
+#Passo 3 - NICK
+def nick(conexao, dados):
+    nickname = dados.split(b' ', 1)[1]
+    nickname = nickname.split(MSG_END)[0]
+
+    if validar_nome(nickname):
+        #Passo 4 - Checa se nickname existe
+
+        # Registrando um nickname de outro usuario para si mesmo
+        if all_nicknames.get(nickname.lower()) and all_nicknames.get(conexao.nick_atual) == None:
+            conexao.enviar(b':server 433 * ' + nickname + b' :Nickname is already in use' + b'\r\n')
+
+        # Editando o seu nickname para um nick ja registrado
+        elif all_nicknames.get(nickname.lower()) or nickname == conexao.nick_atual:
+            conexao.enviar(b':server 433 ' + conexao.nick_atual + b' ' + nickname + b' :Nickname is already in use' + b'\r\n')
+
+        # O nickname eh valido
+        else:
+            # Primeiro registro valido do usuario
+            if all_nicknames.get(conexao.nick_atual) == None:
+                conexao.nick_atual = nickname
+                all_nicknames[conexao.nick_atual.lower()] = conexao
+                conexao.enviar(b':server 001 ' + conexao.nick_atual + b' :Welcome' + b'\r\n')
+                conexao.enviar(b':server 422 ' + conexao.nick_atual + b' :MOTD File is missing' + b'\r\n')
+            # Troca de nickname apos se registrar anteriormente
+            else:
+                nick_antigo = conexao.nick_atual
+                conexao.enviar(b':'+ nick_antigo + b' NICK ' + nickname + b'\r\n')
+                conexao.nick_atual = nickname
+                all_nicknames[conexao.nick_atual.lower()] = conexao
+                del all_nicknames[nick_antigo.lower()]
+
+            # Ja que houve novo nick, deve-se ordenar a lista de nicknames alfabeticamente
+            listNicknames = list(all_nicknames.keys())
+            listNicknames.sort()
+            for nick in listNicknames:
+                conexaoNick = all_nicknames[nick.lower()] # Guarda o objeto Conexao do nick para inseri-lo na posicao correta depois
+                del all_nicknames[nick.lower()]
+                all_nicknames[nick.lower()] = conexaoNick
+
+    else:
+        conexao.enviar(b':server 432 ' + conexao.nick_atual + b' ' + nickname + b' :Erroneous nickname' + b'\r\n')
+
+#Passo 5 - PRIVMSG
+def privmsg(conexao, dados):
+    destiny, dlm, msg = dados.partition(b':')
+    destiny = destiny.split(b' ')[1]
+
+    #PRIVMSG to channel
+    if destiny.startswith(b'#') and all_channels.get(destiny.lower()): #Ignora msgs para channels invalidos
+        channel = all_channels.get(destiny.lower())
+        if conexao in channel.conexoes: #ignora msgs se o user não está no channel
+            for con in channel.conexoes:
+                if con != conexao:
+                    con.enviar(b':' + conexao.nick_atual + b' PRIVMSG ' + channel.nome + b' :' + msg)
+    
+    #PRIVMSG to user
+    else:
+        destiny_conexao = all_nicknames.get(destiny.lower())
+        if destiny_conexao != None: # Ignorar mensagens para nicks invalidos
+            destiny_conexao.enviar(b':' + conexao.nick_atual + b' PRIVMSG ' + destiny + b' :' + msg)
+
+            
+# Passo 6 - JOIN
+def join(conexao, dados):
+    channel_name = dados.split(b' ', 1)[1]
+    channel_name = channel_name.split(MSG_END)[0]
+
+    if channel_name.startswith(b'#') and validar_nome(channel_name.split(b'#')[1]):
+        if not all_channels.get(channel_name.lower()): # Canal não registrado
+            channel = Channel(channel_name)
+            all_channels[channel.nome.lower()] = channel
+
+        channel = all_channels.get(channel_name.lower())
+        channel.connect(conexao)
+        
+    else:
+        conexao.enviar(b':server 403 ' + channel_name + b' :No such channel' + b'\r\n')
+
+#Passo 7 - PART
+def part(conexao, dados):
+    channel_name = dados.split(b' ', 1)[1]
+    channel_name = channel_name.split(MSG_END)[0]
+    channel_name = channel_name.split(b':')[0] # Ignora mensagens que nao envolvem o nome do canal
+    channel_name = channel_name.split(b' ')[0] # Retira o espaço antes de ':' da mensagem ignorada
+
+    if all_channels.get(channel_name.lower()):
+        channel = all_channels.get(channel_name.lower())
+        channel.disconnect(conexao)
+    else:
+        conexao.enviar(b':server 403 ' + channel_name + b' :No such channel' + b'\r\n')
+
+# Comandos possiveis
 def dados_recebidos(conexao, dados):
+    
     if dados == b'':
         return sair(conexao)
-    print(conexao, dados)
+    
+    #Passo 2 - Tratando mensagens 'quebradas'
+    conexao.residuais = conexao.residuais + dados
+    
+    while MSG_END in conexao.residuais:
 
+        dados, dlm, conexao.residuais = conexao.residuais.partition(MSG_END)
+        dados = dados + dlm
+
+        #Passo 1 - PING/PONG
+        if dados.startswith(b'PING'):
+            ping(conexao, dados)
+   
+        #Passo 3 - NICK
+        if dados.startswith(b'NICK'):
+            nick(conexao, dados)
+
+        #Passo 5 - PRIVMSG
+        if dados.startswith(b'PRIVMSG'):
+            privmsg(conexao, dados)
+
+        #Passo 6 - JOIN
+        if dados.startswith(b'JOIN'):
+            join(conexao, dados)
+
+        #Passo 7 - PART
+        if dados.startswith(b'PART'):
+            part(conexao, dados)
+
+    #print(conexao, dados)
+    
 
 def conexao_aceita(conexao):
+    conexao.residuais = b''
+    conexao.nick_atual = b'*'
+    conexao.channels = []
     print(conexao, 'nova conexão')
     conexao.registrar_recebedor(dados_recebidos)
 
 
+class Channel:
+    def __init__(self, nome):
+        self.nome = nome
+        self.conexoes = []
+
+    def connect(self, conexao):
+        if conexao not in self.conexoes:
+            self.conexoes.append(conexao)
+
+            # Ja que houve novo usuario entrando no canal, deve-se ordenar a lista de nicknames alfabeticamente
+            listNicknames = list(all_nicknames.keys())
+            for nick in listNicknames:
+                for con in self.conexoes:
+                    if all_nicknames[nick.lower()] == con: # Achou a conexao na lista geral
+                        conexaoNick = con # Guarda o objeto Conexao para inseri-lo na posicao correta depois
+                        self.conexoes.remove(conexaoNick)
+                        self.conexoes.append(conexaoNick)
+
+            conexao.channels.append(self)
+
+            for con in self.conexoes:
+                con.enviar(b':' + conexao.nick_atual + b' JOIN :' + self.nome + b'\r\n')
+
+            #Passo 9 - 353 e 366 MSGS
+            msg = b':server 353 ' + conexao.nick_atual + b' = ' + self.nome + b' :'
+            for usr in self.conexoes:
+                if len(msg + usr.nick_atual + b' ' + MSG_END) < 512:
+                    msg += usr.nick_atual + b' '
+                else:
+                    conexao.enviar(msg - b' ' + MSG_END) # Retira o ultimo espaço adicionado
+                    msg = b':server 353 ' + conexao.nick_atual + b' = ' + self.nome + b' : ' + usr.nick_atual 
+                
+            conexao.enviar(msg + MSG_END)
+            conexao.enviar(b':server 366 ' + conexao.nick_atual + b' ' + self.nome + b' :End of /NAMES list.' + MSG_END)
+
+
+    def disconnect(self, conexao):
+        for con in self.conexoes:
+            con.enviar(b':' + conexao.nick_atual + b' PART ' + self.nome + b'\r\n')
+        
+        self.conexoes.remove(conexao)
+        conexao.channels.remove(self)
+
+        if len(conexao.channels) == 0:
+            conexao.fechar()
+
+warnings.simplefilter('ignore')
 servidor = Servidor(6667)
 servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
 asyncio.get_event_loop().run_forever()
